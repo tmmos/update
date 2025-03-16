@@ -76,7 +76,7 @@ mkdir -p "$(dirname "$SERVICE_FILE")"
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=PPROXY Proxy Service
+Description=sService
 After=network.target
 
 [Service]
