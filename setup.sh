@@ -1,23 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
-if [[ $EUID -eq 0 ]]; then
-    echo "Running as root."
-    IS_ROOT=true
-else
-    echo "Running as non-root user."
-    IS_ROOT=false
-fi
-
-if [ "$#" -ne 3 ]; then
-    echo "Usage: $0 <PORT> <USERNAME> <PASSWORD>"
+# Check the number of arguments
+if [ "$#" -ne 5 ]; then
+    echo "Usage: $0 <PORT> <USERNAME> <PASSWORD> <SSH_USERNAME> <SSH_PASSWORD>"
     exit 1
 fi
 
-PORT="$1"
-USERNAME="$2"
-PASSWORD="$3"
+# Assign arguments to variables
+PORT="$1"                # Port on which pproxy will run
+PROXY_USERNAME="$2"      # Proxy username
+PROXY_PASSWORD="$3"      # Proxy password
+SSH_USERNAME="$4"        # SSH username (the user running the script, must have sudo privileges)
+SSH_PASSWORD="$5"        # Password for SSH_USERNAME
 
+# Verify that PORT is a number and within the valid range (1024-65535)
 if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
     echo "PORT must be a number." >&2
     exit 1
@@ -28,88 +25,54 @@ if (( PORT < 1024 || PORT > 65535 )); then
     exit 1
 fi
 
-if [ "$IS_ROOT" = true ]; then
-    if command -v pip3 >/dev/null 2>&1; then
-        echo "pip3 is installed at: $(command -v pip3)"
-    else
-        echo "pip3 not found. Please install pip3 system-wide." >&2
+# If not running as root, automatically switch to root using sudo
+if [[ $EUID -ne 0 ]]; then
+    echo "Not running as root. Switching to root..."
+    # Use sudo -S and automatically provide the password
+    echo "$SSH_PASSWORD" | sudo -S "$0" "$@"
+    exit $?
+fi
+
+echo "Running as root."
+
+# Check for the existence of pip3
+if command -v pip3 >/dev/null 2>&1; then
+    echo "pip3 is installed at: $(command -v pip3)"
+else
+    echo "pip3 not found. Please install pip3 on the system." >&2
+    exit 1
+fi
+
+# Check and install/upgrade pproxy
+if command -v pproxy >/dev/null 2>&1; then
+    PPROXY_PATH=$(command -v pproxy)
+    echo "pproxy is installed at: $PPROXY_PATH"
+else
+    echo "Installing/upgrading system-wide pproxy..."
+    if ! pip3 install --upgrade pproxy; then
+        echo "Failed to install/upgrade pproxy." >&2
         exit 1
     fi
-
     if command -v pproxy >/dev/null 2>&1; then
         PPROXY_PATH=$(command -v pproxy)
         echo "pproxy is installed at: $PPROXY_PATH"
     else
-        echo "Installing/upgrading system-wide pproxy..."
-        if ! pip3 install --upgrade pproxy; then
-            echo "Failed to install/upgrade pproxy." >&2
-            exit 1
-        fi
-        if command -v pproxy >/dev/null 2>&1; then
-            PPROXY_PATH=$(command -v pproxy)
-            echo "pproxy is installed at: $PPROXY_PATH"
-        else
-            echo "pproxy installation failed; executable not found." >&2
-            exit 1
-        fi
-    fi
-else
-    if command -v pip3 >/dev/null 2>&1; then
-        echo "pip3 is installed at: $(command -v pip3)"
-    else
-        echo "pip3 not found. Installing pip3..."
-        mkdir -p "$HOME/.local/bin"
-        if ! wget -q https://bootstrap.pypa.io/get-pip.py -O "$HOME/get-pip.py"; then
-            echo "Failed to download get-pip.py." >&2
-            exit 1
-        fi
-        python3 "$HOME/get-pip.py" --user
-        rm -f "$HOME/get-pip.py"
-    fi
-
-    export PATH="$HOME/.local/bin:$PATH"
-
-    if command -v pproxy >/dev/null 2>&1; then
-        PPROXY_PATH=$(command -v pproxy)
-        echo "pproxy is installed at: $PPROXY_PATH"
-    else
-        echo "Installing/upgrading pproxy..."
-        if ! pip3 install --user --upgrade pproxy; then
-            echo "Failed to install/upgrade pproxy." >&2
-            exit 1
-        fi
-        if command -v pproxy >/dev/null 2>&1; then
-            PPROXY_PATH=$(command -v pproxy)
-            echo "pproxy is installed at: $PPROXY_PATH"
-        else
-            if [ -f "$HOME/.local/bin/pproxy" ]; then
-                PPROXY_PATH="$HOME/.local/bin/pproxy"
-            elif [ -f "/usr/local/bin/pproxy" ]; then
-                PPROXY_PATH="/usr/local/bin/pproxy"
-            else
-                echo "pproxy installation failed; executable not found." >&2
-                exit 1
-            fi
-            echo "pproxy is installed at: $PPROXY_PATH"
-        fi
+        echo "pproxy installation failed; executable not found." >&2
+        exit 1
     fi
 fi
 
+# Check for systemctl (systemd)
 if ! command -v systemctl >/dev/null 2>&1; then
     echo "systemctl not found. This script requires systemd support." >&2
     exit 1
 fi
 
-if [ "$IS_ROOT" = true ]; then
-    SERVICE_FILE="/etc/systemd/system/muser.service"
-else
-    SERVICE_FILE="$HOME/.config/systemd/user/muser.service"
-fi
+# Since running as root, the service file will be placed in /etc/systemd/system
+SERVICE_FILE="/etc/systemd/system/muser.service"
 
 echo "Creating/updating service file: $SERVICE_FILE"
-if [ "$IS_ROOT" = false ]; then
-    mkdir -p "$HOME/.config/systemd/user"
-fi
+mkdir -p "$(dirname "$SERVICE_FILE")"
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -117,7 +80,7 @@ Description=PPROXY Proxy Service
 After=network.target
 
 [Service]
-ExecStart=$PPROXY_PATH -l "socks5+http://0.0.0.0:$PORT#$USERNAME:$PASSWORD"
+ExecStart=$PPROXY_PATH -l "socks5+http://0.0.0.0:$PORT#$PROXY_USERNAME:$PROXY_PASSWORD"
 Restart=always
 Environment=PYTHONUNBUFFERED=1
 
@@ -125,83 +88,43 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=default.target
 EOF
 
-if [ "$IS_ROOT" = true ]; then
-    echo "Reloading systemd daemon..."
-    if ! systemctl daemon-reload; then
-        echo "Failed to reload systemd configuration." >&2
-        exit 1
-    fi
+echo "Reloading systemd daemon..."
+if ! systemctl daemon-reload; then
+    echo "Failed to reload systemd configuration." >&2
+    exit 1
+fi
 
-    echo "Enabling muser.service..."
-    if ! systemctl enable muser.service; then
-        echo "Failed to enable muser.service." >&2
-        exit 1
-    fi
+echo "Enabling muser.service..."
+if ! systemctl enable muser.service; then
+    echo "Failed to enable muser.service." >&2
+    exit 1
+fi
 
-    if systemctl is-active --quiet muser.service; then
-        echo "Restarting muser.service..."
-        if ! systemctl restart muser.service; then
-            echo "Failed to restart muser.service." >&2
-            exit 1
-        fi
-    else
-        echo "Starting muser.service..."
-        if ! systemctl start muser.service; then
-            echo "Failed to start muser.service." >&2
-            exit 1
-        fi
-    fi
-
-    if systemctl is-active --quiet muser.service; then
-        echo "muser.service is running successfully."
-    else
-        echo "muser.service failed to run." >&2
+if systemctl is-active --quiet muser.service; then
+    echo "Restarting muser.service..."
+    if ! systemctl restart muser.service; then
+        echo "Failed to restart muser.service." >&2
         exit 1
     fi
 else
-    echo "Reloading user systemd configuration..."
-    if ! systemctl --user daemon-reload; then
-        echo "Failed to reload systemd configuration." >&2
+    echo "Starting muser.service..."
+    if ! systemctl start muser.service; then
+        echo "Failed to start muser.service." >&2
         exit 1
     fi
+fi
 
-    echo "Enabling user muser.service..."
-    if ! systemctl --user enable muser.service; then
-        echo "Failed to enable muser.service." >&2
-        exit 1
-    fi
-
-    if systemctl --user is-active --quiet muser.service; then
-        echo "Restarting muser.service..."
-        if ! systemctl --user restart muser.service; then
-            echo "Failed to restart muser.service." >&2
-            exit 1
-        fi
-    else
-        echo "Starting muser.service..."
-        if ! systemctl --user start muser.service; then
-            echo "Failed to start muser.service." >&2
-            exit 1
-        fi
-    fi
-
-    if systemctl --user is-active --quiet muser.service; then
-        echo "muser.service is running successfully."
-    else
-        echo "muser.service failed to run." >&2
-        exit 1
-    fi
+if systemctl is-active --quiet muser.service; then
+    echo "muser.service is running successfully."
+else
+    echo "muser.service failed to run." >&2
+    exit 1
 fi
 
 echo "Clearing logs and history for security..."
 rm -f ~/.bash_history ~/.python_history ~/.wget-hsts || true
 history -c 2>/dev/null || true
-if [ "$IS_ROOT" = true ]; then
-    journalctl --rotate >/dev/null 2>&1 || true
-    journalctl --vacuum-time=1s >/dev/null 2>&1 || true
-else
-    journalctl --user --rotate >/dev/null 2>&1 || true
-    journalctl --user --vacuum-time=1s >/dev/null 2>&1 || true
-fi
+journalctl --rotate >/dev/null 2>&1 || true
+journalctl --vacuum-time=1s >/dev/null 2>&1 || true
 
-echo "pproxy is running on port $PORT with authentication $USERNAME:$PASSWORD."
+echo "pproxy is running on port $PORT with authentication $PROXY_USERNAME:$PROXY_PASSWORD."
